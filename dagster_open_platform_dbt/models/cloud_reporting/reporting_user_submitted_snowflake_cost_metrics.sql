@@ -6,20 +6,40 @@
     on_schema_change='append_new_columns',
   )
 }}
+--Disable sqlfluff rule for unused CTEs, since we
+--use them in the incremental case
+--noqa: disable=L045
 
-with snowflake_cost_observation_metadata as (
-    select *
-    from {{ ref('snowflake_cost_observation_metadata') }}
-),
-
-base_asset_metrics as (
+with base_asset_metrics as (
     select *
     from {{ ref('int_base_asset_metrics') }}
+    {% if is_incremental() %}
+    where run_ended_at >= '{{ var('min_date') }}' and run_ended_at < '{{ var('max_date') }}'
+    {% endif %}
 ),
 
 reporting_step_data as (
     select *
     from {{ ref('reporting_step_data') }}
+    {% if is_incremental() %}
+    where run_ended_at >= '{{ var('min_date') }}' and run_ended_at < '{{ var('max_date') }}'
+    {% endif %}
+),
+
+metadata_range_start as (
+    select min(run_started_at) as min_date from reporting_step_data
+),
+
+metadata_range_end as (
+    select max(run_ended_at) as max_date from reporting_step_data
+),
+
+snowflake_cost_observation_metadata as (
+    select *
+    from {{ ref('snowflake_cost_observation_metadata') }}
+    {% if is_incremental() %}
+    where created_at >= (select min_date from metadata_range_start) and created_at <= (select max_date from metadata_range_end)
+    {% endif %}
 ),
 
 snowflake_cost_submissions as (
@@ -34,7 +54,6 @@ snowflake_asset_cost_metrics as (
             'base_asset_metrics.deployment_id',
             'base_asset_metrics.step_data_id',
             'base_asset_metrics.asset_key',
-            'base_asset_metrics.asset_group',
             'base_asset_metrics.partition',
             'snowflake_cost_submissions.metric_name',
         ]) }} as unique_key,
@@ -48,7 +67,8 @@ snowflake_asset_cost_metrics as (
         sum(snowflake_cost_submissions.snowflake_cost) as metric_value,
         max(base_asset_metrics._incremented_at) as last_rebuilt,
         1 as metric_multi_asset_divisor,
-        max(run_ended_at) as run_ended_at
+        max(run_ended_at) as run_ended_at,
+        base_asset_metrics.run_id
 
 
     from snowflake_cost_submissions
@@ -62,6 +82,7 @@ snowflake_asset_cost_metrics as (
         )
     where
         snowflake_cost_submissions.opaque_id is not null
+        and {{ limit_dates_for_insights(ref_date = 'run_ended_at') }}
     group by all
 ),
 
@@ -83,7 +104,8 @@ snowflake_job_cost_metrics as (
         sum(snowflake_cost_submissions.snowflake_cost) as metric_value,
         max(reporting_step_data.last_rebuilt) as last_rebuilt,
         1 as metric_multi_asset_divisor,
-        max(run_ended_at) as run_ended_at
+        max(run_ended_at) as run_ended_at,
+        reporting_step_data.run_id
 
 
     from snowflake_cost_submissions
@@ -97,6 +119,7 @@ snowflake_job_cost_metrics as (
     where
         snowflake_cost_submissions.opaque_id is not null
         and snowflake_cost_observation_metadata.asset_key like '["__snowflake_query_metadata_%'
+        and {{ limit_dates_for_insights(ref_date = 'run_ended_at') }}
     group by all
 )
 
